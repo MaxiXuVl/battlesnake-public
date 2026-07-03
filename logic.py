@@ -85,9 +85,9 @@ def get_info() -> Dict[str, str]:
     return {
         "apiversion": "1",
         "author": "hackathon",
-        "color": "#6434eb",
-        "head": "smart-caterpillar",
-        "tail": "weight",
+       "color": "#E80978",
+        "head": "beluga",
+        "tail": "curled",
         "version": "2.0.0-food-tail-anti-trap",
     }
 
