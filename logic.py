@@ -13,6 +13,11 @@ Board coordinates: ``(0, 0)`` is the bottom-left corner.
 Game-state schema reference: https://docs.battlesnake.com/api
 """
 
+# new
+import time
+
+LOOKAHEAD_TIMEOUT_MS = 380  # у Battlesnake 500ms лимит, оставляем буфер
+
 from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -52,6 +57,20 @@ def choose_move(game_state: Dict) -> str:
     if move is not None:
         return move
     return choose_move_heuristic(game_state)
+
+# new
+def _killable_cells(snakes: List[Dict], my_id: str, my_length: int) -> Set[Point]:
+    """Клетки, куда можно выйти нос-к-носу и выиграть (мы строго длиннее)."""
+    kills: Set[Point] = set()
+    for snake in snakes:
+        if snake["id"] == my_id:
+            continue
+        if snake["length"] >= my_length:  # строго длиннее нужно быть нам
+            continue
+        ehead = (snake["head"]["x"], snake["head"]["y"])
+        for dx, dy in DIRECTIONS.values():
+            kills.add((ehead[0] + dx, ehead[1] + dy))
+    return kills
 
 
 def choose_move_heuristic(game_state: Dict) -> str:
@@ -100,16 +119,39 @@ def choose_move_heuristic(game_state: Dict) -> str:
     # No safe move found -> we're cornered. Move up and hope for the best.
     return best_move or "up"
 
+# old
+# def _occupied_cells(snakes: List[Dict]) -> Set[Point]:
+#     """All cells currently filled by any snake's body.
+
+#     We keep tails occupied too; they only free up *next* turn and treating them
+#     as solid is the conservative, safe choice for a base bot.
+#     """
+#     occupied: Set[Point] = set()
+#     for snake in snakes:
+#         for seg in snake["body"]:
+#             occupied.add((seg["x"], seg["y"]))
+#     return occupied
 
 def _occupied_cells(snakes: List[Dict]) -> Set[Point]:
-    """All cells currently filled by any snake's body.
+    occupied: Set[Point] = set()
+    for snake in snakes:
+        body = snake["body"]
+        for seg in body:
+            occupied.add((seg["x"], seg["y"]))
+    return occupied
 
-    We keep tails occupied too; they only free up *next* turn and treating them
-    as solid is the conservative, safe choice for a base bot.
+# new
+def _occupied_cells_next_turn(snakes: List[Dict]) -> Set[Point]:
+    """Занятые клетки ПОСЛЕ того, как все змейки сделают ход.
+    Хвост освобождается, если змейка не ела (body[-1] != body[-2]).
     """
     occupied: Set[Point] = set()
     for snake in snakes:
-        for seg in snake["body"]:
+        body = snake["body"]
+        # Определяем, поела ли змейка: если ела — два последних сегмента одинаковы
+        just_ate = len(body) >= 2 and body[-1]["x"] == body[-2]["x"] and body[-1]["y"] == body[-2]["y"]
+        end = len(body) if just_ate else len(body) - 1
+        for seg in body[:end]:
             occupied.add((seg["x"], seg["y"]))
     return occupied
 
@@ -204,8 +246,9 @@ def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
     dx, dy = DIRECTIONS[move]
     nxt = (head[0] + dx, head[1] + dy)
 
-    occupied = _occupied_cells(board["snakes"])
+    occupied = _occupied_cells_next_turn(board["snakes"])
     danger = _head_to_head_cells(board["snakes"], you["id"], my_length)
+    killable = _killable_cells(board["snakes"], you["id"], my_length)
     foods = [(f["x"], f["y"]) for f in board["food"]]
     enemies = [s for s in board["snakes"] if s["id"] != you["id"]]
     enemy_heads = [(s["head"]["x"], s["head"]["y"]) for s in enemies]
@@ -234,6 +277,7 @@ def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
 
     return {
         "space_capped": float(_flood_fill(nxt, occupied, width, height, limit=my_length + 1)),
+        "can_kill": 1.0 if nxt in killable else 0.0,
         "open_space": float(_flood_fill(nxt, occupied, width, height, limit=width * height)),
         "voronoi": float(voronoi),
         "reaches_tail": reaches_tail,
@@ -255,6 +299,7 @@ def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
 _MODEL: Dict = {
     "feature_names": [
         "space_capped",
+        "can_kill",
         "open_space",
         "voronoi",
         "reaches_tail",
@@ -270,6 +315,7 @@ _MODEL: Dict = {
     ],
     "mean": [
         7.357954545454546,
+        15,
         100.9034090909091,
         48.26988636363637,
         0.9943181818181818,
@@ -333,16 +379,45 @@ def choose_move_model(game_state: Dict) -> Optional[str]:
     std = _MODEL["std"]
     coef = _MODEL["coef"]
     intercept = _MODEL["intercept"]
+    
+    # new
+    board = game_state["board"]
+    you = game_state["you"]
+    width, height = board["width"], board["height"]
+    my_length = you["length"]
+    occupied = _occupied_cells(board["snakes"])
 
-    best_move, best_score = None, float("-inf")
+    # old
+#     best_move, best_score = None, float("-inf")
+#     for move in legal:
+#         feats = _candidate_features(game_state, move)
+#         score = intercept
+#         for i, name in enumerate(names):
+#             z = (feats.get(name, 0.0) - mean[i]) / std[i] if std[i] else 0.0
+#             score += coef[i] * z
+#         if score > best_score:
+#             best_score, best_move = score, move
+
+    scores = {}
     for move in legal:
         feats = _candidate_features(game_state, move)
         score = intercept
         for i, name in enumerate(names):
             z = (feats.get(name, 0.0) - mean[i]) / std[i] if std[i] else 0.0
             score += coef[i] * z
-        if score > best_score:
-            best_score, best_move = score, move
+        
+        # Хард-блок: если flood fill меньше нашей длины — почти верная ловушка
+        dx, dy = DIRECTIONS[move]
+        head = (you["head"]["x"], you["head"]["y"])
+        nxt = (head[0] + dx, head[1] + dy)
+        space = _flood_fill(nxt, occupied, width, height, limit=width * height)
+        if space < my_length:
+            score -= 50_000  # жёстко штрафуем, не запрещаем (вдруг других нет)
+        
+        scores[move] = score
+
+    return max(scores, key=scores.__getitem__)
+          
     return best_move
 
 
