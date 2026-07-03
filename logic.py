@@ -14,6 +14,8 @@ Main strategy:
    - avoid one-way pockets unless panic-hungry.
 4. If not eating, prefer tail-chasing / space-control, which is safer for long snakes.
 5. Use head-to-head danger and enemy race-to-food checks.
+6. Detect pressure near walls/enemy bodies and prefer escaping into open space.
+7. If safely stronger, hunt by cutting enemy space / controlling gates, not by reckless chasing.
 
 This file uses only stdlib and is defensive: if anything fails, choose_move returns
 some legal-ish move instead of crashing the server.
@@ -88,7 +90,7 @@ def get_info() -> Dict[str, str]:
         "color": "#6434eb",
         "head": "smart-caterpillar",
         "tail": "weight",
-        "version": "2.0.0-food-tail-anti-trap",
+        "version": "3.0.0-food-hunt-pressure",
     }
 
 
@@ -126,7 +128,7 @@ def choose_move_safe(game_state: Dict) -> str:
     food_plan: Optional[FoodPlan] = None
     if mode in {"panic_food", "food", "grow"}:
         food_plan = choose_food_plan(board, you, mode, candidates)
-    elif mode == "control":
+    elif mode in {"control", "hunt"}:
         food_plan = choose_food_plan(board, you, "opportunistic_food", candidates)
 
     if food_plan is not None:
@@ -158,18 +160,29 @@ def _mode(board: Dict, you: Dict) -> str:
 
     if health <= PANIC_HEALTH:
         return "panic_food"
+
+    blocked = _blocked_for_planning(board, you, assume_our_next=None)
+    blocked.discard(head)
+    current_room = _flood_fill(head, blocked, width, height, limit=width * height)
+    pressure = _pressure_score(board, you, head)
+
+    # If we are already being squeezed, escape pressure before chasing food.
+    # Exception: panic hunger, handled above.
+    if pressure >= 5 or (pressure >= 3 and current_room < max(length * 2, length + 10)):
+        return "escape_pressure"
+
     if health <= HUNGRY_HEALTH:
         return "food"
     if length < GROW_UNTIL_LENGTH:
         return "grow"
 
-    blocked = _blocked_for_planning(board, you, assume_our_next=None)
-    blocked.discard(head)
-    current_room = _flood_fill(head, blocked, width, height, limit=width * height)
-
     # If already cramped, do not think about fancy attack/food. Survive.
     if current_room < max(length * 2, length + 8):
         return "survival"
+
+    # Hunt only when not hungry, not pressured, and there is a smaller enemy to cut off.
+    if _can_hunt(board, you):
+        return "hunt"
 
     # Long healthy snakes should stop overeating and maintain a tail route.
     if length >= LONG_SNAKE_LENGTH and health > HUNGRY_HEALTH:
@@ -330,6 +343,16 @@ def _build_food_plan(
     elif wall_dist == 1 and length >= LONG_SNAKE_LENGTH:
         score -= 500.0
 
+    # Do not let food pull a healthy snake into pressure or a corridor pocket.
+    pressure_at_food = _pressure_score(board, you, food)
+    chamber = _chamber_info(sim_head, sim_blocked - {sim_head}, width, height)
+    if mode != "panic_food":
+        score -= 550.0 * pressure_at_food
+        if chamber["junctions"] == 0 and chamber["size"] < expected_len * 3:
+            score -= 3_500.0
+        if pressure_at_food >= 4 and not reaches_tail:
+            score -= 5_000.0
+
     return FoodPlan(
         food=food,
         path=path,
@@ -442,6 +465,15 @@ def score_space_moves(board: Dict, you: Dict, candidates: Sequence[Candidate], m
         next_safe = _next_safe_move_count(board, you, p)
         reaches_tail = _reachable(p, tail, blocked - {tail}, width, height)
         vor = _voronoi_control(board, you, p, blocked, width, height)
+        pressure = _pressure_score(board, you, p)
+        chamber = _chamber_info(p, blocked, width, height)
+        enemy_cut = _enemy_space_reduction(board, you, p)
+        dist_small_head = _distance_to_nearest_smaller_head(board, you, p)
+
+        reasons["pressure"] = float(pressure)
+        reasons["chamber_size"] = float(chamber["size"])
+        reasons["chamber_junctions"] = float(chamber["junctions"])
+        reasons["enemy_cut"] = float(enemy_cut)
 
         reasons["room"] = float(room)
         reasons["exits"] = float(exits)
@@ -483,12 +515,38 @@ def score_space_moves(board: Dict, you: Dict, candidates: Sequence[Candidate], m
         # Territory.
         score += 7.0 * vor
 
+        # Pressure / anti-squeeze: do not allow enemies to pin us against walls or bodies.
+        score -= 950.0 * pressure
+        if pressure >= 5 and room < length * 3:
+            score -= 8_000.0
+
+        # Chamber structure: a large flood-fill can still be bad if it is a long corridor
+        # with no junctions. Prefer open rooms; avoid one-gate pockets.
+        if chamber["size"] < length:
+            score -= 30_000.0
+        if chamber["junctions"] == 0 and chamber["size"] < length * 3:
+            score -= 4_500.0
+        elif chamber["junctions"] >= 2:
+            score += min(chamber["junctions"], 6) * 700.0
+
+        # Hunt signal: occupy cells that cut off smaller enemies, but only when
+        # our own safety signals are healthy.
+        if room >= length * 2 and exits >= 2 and reaches_tail:
+            score += 120.0 * enemy_cut
+
         # Attack only if it does not break safety.
         if p in smaller_head_next and room >= length * 2 and reaches_tail:
-            score += 3_000.0
+            score += 4_500.0 if mode == "hunt" else 3_000.0
             reasons["attack"] = 1.0
         else:
             reasons["attack"] = 0.0
+
+        # In hunt mode, staying close to a smaller head can be useful, but only
+        # as positional pressure. Do not reward it if we are boxed in.
+        if mode == "hunt" and room >= length * 2 and exits >= 2:
+            if dist_small_head <= 3:
+                score += 1_200.0 / max(1, dist_small_head)
+            score += 160.0 * enemy_cut
 
         # Avoid unnecessary eating when long and healthy.
         if p in foods:
@@ -521,6 +579,24 @@ def score_space_moves(board: Dict, you: Dict, candidates: Sequence[Candidate], m
             # Don't keep expanding indefinitely.
             if p in foods and health > HUNGRY_HEALTH:
                 score -= 2_000.0
+        elif mode == "escape_pressure":
+            # Primary goal: get away from wall/body squeeze into an open multi-exit chamber.
+            score += 70.0 * room
+            score += 3_500.0 * exits
+            score -= 1_600.0 * pressure
+            score += 4_000.0 if reaches_tail else -2_500.0
+            # Prefer moving toward center while escaping.
+            score -= 40.0 * center_dist
+        elif mode == "hunt":
+            # Hunt by space cutting, not suicide chasing.
+            score += 12.0 * vor
+            score += 220.0 * enemy_cut
+            score -= 1_200.0 * pressure
+            if exits < 2 or not reaches_tail:
+                score -= 7_000.0
+            # Avoid eating during a good hunt unless hungry; growth can ruin the cut.
+            if p in foods and health > HUNGRY_HEALTH:
+                score -= 1_200.0
         elif mode == "control":
             score += 3.0 * vor
             score += 8.0 * room
@@ -588,6 +664,149 @@ def fallback_move(game_state: Dict) -> str:
         pass
     return "up"
 
+
+
+# ---------------------------------------------------------------------------
+# Pressure, chambers, and hunting
+# ---------------------------------------------------------------------------
+
+def _can_hunt(board: Dict, you: Dict) -> bool:
+    """We hunt only if there is a smaller enemy and we are not cramped."""
+    my_len = int(you.get("length", len(you.get("body", []))))
+    if int(you.get("health", 0)) <= HUNGRY_HEALTH:
+        return False
+    width, height = int(board["width"]), int(board["height"])
+    head = _head(you)
+    blocked = _blocked_for_planning(board, you, assume_our_next=None)
+    blocked.discard(head)
+    room = _flood_fill(head, blocked, width, height, width * height)
+    if room < max(my_len * 2, my_len + 10):
+        return False
+    for enemy in board.get("snakes", []):
+        if enemy.get("id") == you.get("id"):
+            continue
+        e_len = int(enemy.get("length", len(enemy.get("body", []))))
+        if e_len < my_len:
+            return True
+    return False
+
+
+def _pressure_score(board: Dict, you: Dict, cell: Point) -> float:
+    """How strongly this cell is squeezed by walls, enemy bodies and dangerous heads."""
+    width, height = int(board["width"]), int(board["height"])
+    my_len = int(you.get("length", len(you.get("body", []))))
+    score = 0.0
+
+    # Walls: corner is much worse than a single wall.
+    if cell[0] == 0 or cell[0] == width - 1:
+        score += 1.4
+    elif cell[0] == 1 or cell[0] == width - 2:
+        score += 0.45
+    if cell[1] == 0 or cell[1] == height - 1:
+        score += 1.4
+    elif cell[1] == 1 or cell[1] == height - 2:
+        score += 0.45
+
+    for snake in board.get("snakes", []):
+        if snake.get("id") == you.get("id"):
+            continue
+        enemy_len = int(snake.get("length", len(snake.get("body", []))))
+        enemy_head = _head(snake)
+        d_head = _manhattan(cell, enemy_head)
+
+        # Big/equal heads squeeze us; small heads are attack opportunities, not pressure.
+        if enemy_len >= my_len:
+            if d_head == 1:
+                score += 4.0
+            elif d_head == 2:
+                score += 1.4
+        else:
+            if d_head == 1:
+                score -= 0.8
+
+        # Enemy bodies next to us restrict escape lines.
+        for p in _body(snake):
+            if _manhattan(cell, p) == 1:
+                score += 0.7
+
+    return score
+
+
+def _chamber_info(start: Point, blocked: Set[Point], width: int, height: int) -> Dict[str, int]:
+    """Approximate local room structure behind a move.
+
+    size: reachable free cells.
+    junctions: cells with >=3 free neighbours. More junctions means less corridor-like.
+    corridor_cells: cells with <=2 free neighbours. Many corridor cells means bottleneck/dead-end risk.
+    gates: cells with exactly 2 free neighbours; rough proxy for narrow passage.
+    """
+    if not _in_bounds(start, width, height) or start in blocked:
+        return {"size": 0, "junctions": 0, "corridor_cells": 0, "gates": 0}
+    q: deque[Point] = deque([start])
+    seen: Set[Point] = {start}
+    junctions = 0
+    corridor_cells = 0
+    gates = 0
+    while q:
+        cur = q.popleft()
+        free_neigh = 0
+        for delta in DIRECTIONS.values():
+            nxt = _add(cur, delta)
+            if not _in_bounds(nxt, width, height) or nxt in blocked:
+                continue
+            free_neigh += 1
+            if nxt not in seen:
+                seen.add(nxt)
+                q.append(nxt)
+        if free_neigh >= 3:
+            junctions += 1
+        if free_neigh <= 2:
+            corridor_cells += 1
+        if free_neigh == 2:
+            gates += 1
+    return {"size": len(seen), "junctions": junctions, "corridor_cells": corridor_cells, "gates": gates}
+
+
+def _enemy_space_reduction(board: Dict, you: Dict, my_next: Point) -> float:
+    """Positive when our move cuts space from smaller enemies.
+
+    This is the main hunt signal. It rewards occupying a gate / cutting line when
+    it materially reduces a smaller enemy's flood-fill area while we stay safe.
+    """
+    width, height = int(board["width"]), int(board["height"])
+    my_len = int(you.get("length", len(you.get("body", []))))
+    base_blocked = _blocked_for_planning(board, you, assume_our_next=None)
+    after_blocked = _blocked_for_planning(board, you, assume_our_next=my_next)
+    after_blocked.add(my_next)
+    gain = 0.0
+    for enemy in board.get("snakes", []):
+        if enemy.get("id") == you.get("id"):
+            continue
+        e_len = int(enemy.get("length", len(enemy.get("body", []))))
+        if e_len >= my_len:
+            continue
+        e_head = _head(enemy)
+        before = _flood_fill(e_head, base_blocked - {e_head}, width, height, width * height)
+        after = _flood_fill(e_head, after_blocked - {e_head}, width, height, width * height)
+        reduction = max(0, before - after)
+        # More valuable if enemy becomes smaller than its body needs.
+        if after < e_len:
+            gain += reduction * 2.5 + 25
+        else:
+            gain += reduction
+    return gain
+
+
+def _distance_to_nearest_smaller_head(board: Dict, you: Dict, cell: Point) -> int:
+    my_len = int(you.get("length", len(you.get("body", []))))
+    best = 10_000
+    for enemy in board.get("snakes", []):
+        if enemy.get("id") == you.get("id"):
+            continue
+        e_len = int(enemy.get("length", len(enemy.get("body", []))))
+        if e_len < my_len:
+            best = min(best, _manhattan(cell, _head(enemy)))
+    return best
 
 # ---------------------------------------------------------------------------
 # Trap / simulation helpers
