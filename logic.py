@@ -35,6 +35,162 @@ HEAD_TO_HEAD_PENALTY = 10_000
 # Below this health we start actively steering toward food.
 HUNGRY_THRESHOLD = 50
 
+def _simulate_one_move(snakes: List[Dict], moves: Dict[str, str], width: int, height: int) -> List[Dict]:
+    """Симулирует один ход всех змеек. Возвращает новый список змеек или пустой список если коллизия."""
+    new_heads = {}
+    for snake in snakes:
+        if snake["id"] not in moves:
+            continue
+        move = moves[snake["id"]]
+        dx, dy = DIRECTIONS[move]
+        head = snake["head"]
+        new_heads[snake["id"]] = (head["x"] + dx, head["y"] + dy)
+    
+    # Определяем коллизии голов
+    dead = set()
+    head_list = list(new_heads.items())
+    for i, (id1, h1) in enumerate(head_list):
+        for j, (id2, h2) in enumerate(head_list):
+            if i >= j:
+                continue
+            if h1 == h2:
+                # Меньшая или равная по длине умирает
+                len1 = next(s["length"] for s in snakes if s["id"] == id1)
+                len2 = next(s["length"] for s in snakes if s["id"] == id2)
+                if len1 <= len2:
+                    dead.add(id1)
+                if len2 <= len1:
+                    dead.add(id2)
+    
+    new_snakes = []
+    foods = set()  # для простоты не симулируем еду в lookahead
+    for snake in snakes:
+        if snake["id"] not in moves or snake["id"] in dead:
+            continue
+        nh = new_heads[snake["id"]]
+        if not (0 <= nh[0] < width and 0 <= nh[1] < height):
+            continue  # вылетел за борт — умер
+        
+        new_body = [{"x": nh[0], "y": nh[1]}] + snake["body"][:-1]
+        new_snakes.append({
+            "id": snake["id"],
+            "head": {"x": nh[0], "y": nh[1]},
+            "body": new_body,
+            "length": snake["length"],
+            "health": snake["health"] - 1,
+        })
+    
+    # Проверяем коллизии с телами
+    all_bodies = set()
+    for s in new_snakes:
+        for seg in s["body"][1:]:  # исключаем голову
+            all_bodies.add((seg["x"], seg["y"]))
+    
+    survivors = []
+    for snake in new_snakes:
+        hx, hy = snake["head"]["x"], snake["head"]["y"]
+        if (hx, hy) not in all_bodies:
+            survivors.append(snake)
+    
+    return survivors
+
+def _evaluate_state_quick(game_state: Dict, my_id: str) -> float:
+    """Быстрая оценка состояния для листовых узлов lookahead."""
+    board = game_state["board"]
+    width, height = board["width"], board["height"]
+    snakes = board["snakes"]
+    
+    me = next((s for s in snakes if s["id"] == my_id), None)
+    if me is None:
+        return -100_000  # мы мертвы
+    
+    if len(snakes) == 1:
+        return 100_000  # единственная выжившая
+    
+    occupied = _occupied_cells_next_turn(snakes)
+    head = (me["head"]["x"], me["head"]["y"])
+    
+    # Воронои
+    enemy_heads = [(s["head"]["x"], s["head"]["y"]) for s in snakes if s["id"] != my_id]
+    my_dist = _bfs_dist([head], occupied, width, height)
+    enemy_dist = _bfs_dist(enemy_heads, occupied, width, height) if enemy_heads else {}
+    voronoi = sum(1 for cell, md in my_dist.items() if md < enemy_dist.get(cell, _BIG))
+    
+    my_space = _flood_fill(head, occupied, width, height, limit=width * height)
+    
+    return float(voronoi) * 2.0 + float(my_space) * 0.5
+
+def choose_move_lookahead(game_state: Dict) -> Optional[str]:
+    """2-ply paranoid lookahead: максимизируем наш счёт при худшем ходе врагов."""
+    start_time = time.time()
+    board = game_state["board"]
+    width, height = board["width"], board["height"]
+    my_id = game_state["you"]["id"]
+    
+    legal = _legal_moves(game_state)
+    if not legal:
+        return None
+    
+    snakes = board["snakes"]
+    enemies = [s for s in snakes if s["id"] != my_id]
+    
+    best_move, best_score = None, float("-inf")
+    
+    for my_move in legal:
+        if (time.time() - start_time) * 1000 > LOOKAHEAD_TIMEOUT_MS:
+            break
+        
+        if not enemies:
+            # Соло режим — просто оцениваем
+            moves = {my_id: my_move}
+            new_snakes = _simulate_one_move(snakes, moves, width, height)
+            if not any(s["id"] == my_id for s in new_snakes):
+                continue
+            new_state = {**game_state, "board": {**board, "snakes": new_snakes}}
+            score = _evaluate_state_quick(new_state, my_id)
+        else:
+            # Paranoid: берём минимум по всем враждебным ходам
+            min_score = float("inf")
+            
+            # Для каждого врага берём его лучший ход против нас
+            enemy_move_options = []
+            for enemy in enemies:
+                e_legal = [
+                    m for m, (dx, dy) in DIRECTIONS.items()
+                    if _in_bounds((enemy["head"]["x"] + dx, enemy["head"]["y"] + dy), width, height)
+                    and (enemy["head"]["x"] + dx, enemy["head"]["y"] + dy) not in _occupied_cells(snakes)
+                ]
+                enemy_move_options.append((enemy["id"], e_legal or ["up"]))
+            
+            # Перебираем комбинации ходов врагов (ограничиваем для скорости)
+            from itertools import product
+            enemy_combos = list(product(*[opts for _, opts in enemy_move_options]))
+            if len(enemy_combos) > 16:
+                enemy_combos = enemy_combos[:16]  # ограничиваем взрыв комбинаций
+            
+            for combo in enemy_combos:
+                moves = {my_id: my_move}
+                for (eid, _), emove in zip(enemy_move_options, combo):
+                    moves[eid] = emove
+                
+                new_snakes = _simulate_one_move(snakes, moves, width, height)
+                new_state = {**game_state, "board": {**board, "snakes": new_snakes}}
+                score = _evaluate_state_quick(new_state, my_id)
+                min_score = min(min_score, score)
+            
+            score = min_score
+        
+        if score > best_score:
+            best_score, best_move = score, best_move or my_move
+            best_move = my_move
+    
+    return best_move
+
+
+
+
+
+
 
 def get_info() -> Dict[str, str]:
     """Appearance + metadata returned from ``GET /``."""
@@ -48,14 +204,32 @@ def get_info() -> Dict[str, str]:
     }
 
 
+# def choose_move(game_state: Dict) -> str:
+#     """Return the next move using the model, with a heuristic fallback."""
+#     try:
+#         move = choose_move_model(game_state)
+#     except Exception:  # noqa: BLE001 - a model issue must never break gameplay
+#         move = None
+#     if move is not None:
+#         return move
+#     return choose_move_heuristic(game_state)
+
+# new
 def choose_move(game_state: Dict) -> str:
-    """Return the next move using the model, with a heuristic fallback."""
+    try:
+        move = choose_move_lookahead(game_state)
+        if move:
+            return move
+    except Exception:
+        pass
+    
     try:
         move = choose_move_model(game_state)
-    except Exception:  # noqa: BLE001 - a model issue must never break gameplay
-        move = None
-    if move is not None:
-        return move
+        if move:
+            return move
+    except Exception:
+        pass
+    
     return choose_move_heuristic(game_state)
 
 # new
