@@ -99,15 +99,19 @@ def get_info() -> Dict[str, str]:
 
 
 def choose_move(game_state: Dict) -> str:
-    """Main decision function called from /move."""
+    """Main decision function called from /move.
+
+    Important tournament guard:
+    even if the strategic layer returns a bad direction or raises an exception,
+    the final answer is validated against the CURRENT board before returning.
+    This prevents accidental moves outside the board, including the old unsafe
+    fallback `return "up"` case when something went wrong.
+    """
     try:
         move = choose_move_safe(game_state)
-        if move in DIRECTIONS:
-            return move
     except Exception:
-        # Never let /move fail in tournament mode.
-        pass
-    return fallback_move(game_state)
+        move = None
+    return _guarded_final_move(game_state, move)
 
 
 # ---------------------------------------------------------------------------
@@ -704,15 +708,61 @@ def _safe_immediate_candidates(board: Dict, you: Dict) -> List[Candidate]:
 
 
 def fallback_move(game_state: Dict) -> str:
+    """Last-resort move selection. Never intentionally returns an off-board move."""
+    return _guarded_final_move(game_state, None)
+
+
+def _guarded_final_move(game_state: Dict, proposed_move: Optional[str]) -> str:
+    """Validate the final move against the current board.
+
+    Priority:
+    1. keep proposed_move if it is inside board and not an immediate body collision;
+    2. use one of the strategic safe candidates;
+    3. use any in-bounds non-occupied move;
+    4. use any in-bounds move even if it hits a body, because body collision is still
+       preferable to walking into a wall when the position is already lost;
+    5. return "up" only if the input state itself is malformed.
+    """
     try:
         board = game_state["board"]
         you = game_state["you"]
         width, height = int(board["width"]), int(board["height"])
         head = _head(you)
+
+        def point_for(move: str) -> Point:
+            return _add(head, DIRECTIONS[move])
+
+        # Immediate collision set with smart own-tail handling for each candidate.
+        if proposed_move in DIRECTIONS:
+            p = point_for(proposed_move)
+            if _in_bounds(p, width, height):
+                try:
+                    blocked = _blocked_for_immediate_move(board, you, p)
+                    if p not in blocked:
+                        return proposed_move
+                except Exception:
+                    # If collision logic itself fails, at least do not walk into a wall.
+                    return proposed_move
+
+        # Recompute official immediate-safe candidates.
+        try:
+            candidates = _safe_immediate_candidates(board, you)
+            if candidates:
+                return candidates[0].move
+        except Exception:
+            pass
+
+        # Any in-bounds non-occupied move.
         occupied = _occupied_cells(board.get("snakes", []))
         for move, delta in DIRECTIONS.items():
             p = _add(head, delta)
             if _in_bounds(p, width, height) and p not in occupied:
+                return move
+
+        # If every in-bounds move collides with a body, still choose in-bounds.
+        for move, delta in DIRECTIONS.items():
+            p = _add(head, delta)
+            if _in_bounds(p, width, height):
                 return move
     except Exception:
         pass
