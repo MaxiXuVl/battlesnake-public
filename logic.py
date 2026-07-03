@@ -187,9 +187,91 @@ def choose_move_lookahead(game_state: Dict) -> Optional[str]:
     return best_move
 
 
+def _hunger_priority(you: Dict, snakes: List[Dict]) -> float:
+    """
+    Возвращает коэффициент приоритета еды от 0.0 до 1.0.
+    Учитывает здоровье И относительную длину среди врагов.
+    """
+    health = you["health"]
+    my_length = you["length"]
+    
+    enemies = [s for s in snakes if s["id"] != you["id"]]
+    if not enemies:
+        # Соло — едим при здоровье < 40
+        return 1.0 if health < 40 else 0.0
+    
+    max_enemy_length = max(s["length"] for s in enemies)
+    
+    # Если кто-то длиннее нас — едим агрессивно всегда
+    if max_enemy_length >= my_length:
+        base_threshold = 80  # едим при здоровье < 80
+    elif max_enemy_length >= my_length - 2:
+        base_threshold = 60  # почти равны — умеренно агрессивны
+    else:
+        base_threshold = 35  # мы явно длиннее — едим только при нужде
+    
+    if health >= base_threshold:
+        return 0.0
+    
+    # Плавный коэффициент: чем ниже здоровье, тем выше приоритет
+    return (base_threshold - health) / base_threshold
 
-
-
+def _safe_foods(
+    foods: List[Point],
+    my_head: Point,
+    enemy_heads: List[Point],
+    occupied: Set[Point],
+    width: int,
+    height: int,
+    my_length: int,
+    snakes: List[Dict],
+    my_id: str,
+) -> List[Tuple[Point, float]]:
+    """
+    Возвращает список (еда, приоритет) только для безопасно достижимой еды.
+    Приоритет выше если: мы ближе к еде, еда изолирована от врагов,
+    поедание даст нам превосходство в длине.
+    """
+    result = []
+    my_dist_map = _bfs_dist([my_head], occupied, width, height)
+    
+    for food in foods:
+        my_d = my_dist_map.get(food, _BIG)
+        if my_d == _BIG:
+            continue  # недостижима
+        
+        # Минимальное расстояние врага до этой еды
+        min_enemy_d = _BIG
+        closest_enemy_length = 0
+        for snake in snakes:
+            if snake["id"] == my_id:
+                continue
+            eh = (snake["head"]["x"], snake["head"]["y"])
+            ed = _bfs_dist([eh], occupied, width, height).get(food, _BIG)
+            if ed < min_enemy_d:
+                min_enemy_d = ed
+                closest_enemy_length = snake["length"]
+        
+        # Еда небезопасна если враг доберётся туда раньше или одновременно
+        # и при этом он не короче нас (иначе мы его можем убить)
+        if min_enemy_d <= my_d and closest_enemy_length >= my_length:
+            continue  # пропускаем опасную еду
+        
+        # Приоритет: близость + ценность роста
+        growth_value = 1.0
+        enemies = [s for s in snakes if s["id"] != my_id]
+        if enemies:
+            max_enemy_len = max(s["length"] for s in enemies)
+            if my_length <= max_enemy_len:
+                # Нам особенно нужна эта еда — растём быстрее
+                growth_value = 3.0
+            elif my_length == max_enemy_len + 1:
+                growth_value = 1.5
+        
+        priority = growth_value / (my_d + 1)
+        result.append((food, priority))
+    
+    return sorted(result, key=lambda x: -x[1])
 
 
 def get_info() -> Dict[str, str]:
@@ -425,6 +507,7 @@ def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
     killable = _killable_cells(board["snakes"], you["id"], my_length)
     foods = [(f["x"], f["y"]) for f in board["food"]]
     enemies = [s for s in board["snakes"] if s["id"] != you["id"]]
+    max_enemy_length = max((s["length"] for s in enemies), default=0)
     enemy_heads = [(s["head"]["x"], s["head"]["y"]) for s in enemies]
     bigger_heads = [(s["head"]["x"], s["head"]["y"]) for s in enemies if s["length"] >= my_length]
 
@@ -437,6 +520,26 @@ def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
     my_tail = (you["body"][-1]["x"], you["body"][-1]["y"])
     reach = _bfs_dist([nxt], occupied - {my_tail}, width, height)
     reaches_tail = 1.0 if my_tail in reach else 0.0
+
+    # Насколько мы короче самого длинного врага
+    length_deficit = float(max(0, max_enemy_length - my_length + 1))
+
+    # Есть ли безопасная еда рядом (в 3 ходах)
+    safe_food_nearby = 0.0
+    hunger_priority = _hunger_priority(you, board["snakes"])
+    if foods:
+        safe_list = _safe_foods(
+            foods, nxt, 
+            [(s["head"]["x"], s["head"]["y"]) for s in enemies],
+            occupied, width, height, my_length, board["snakes"], you["id"]
+        )
+        if safe_list:
+            best_food, _ = safe_list[0]
+            dist_to_safe_food = _manhattan(nxt, best_food)
+            safe_food_nearby = float(width + height - dist_to_safe_food)
+
+    # Ценность роста: насколько важно сейчас есть
+    growth_urgency = length_deficit * hunger_priority
 
     escape = sum(
         1
@@ -464,6 +567,9 @@ def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
         "food_delta": float(nearest_now - nearest_next) if foods else 0.0,
         "is_food": 1.0 if nxt in foods else 0.0,
         "dist_to_center": abs(nxt[0] - (width - 1) / 2) + abs(nxt[1] - (height - 1) / 2),
+        "length_deficit": length_deficit,
+        "safe_food_nearby": safe_food_nearby,
+        "growth_urgency": growth_urgency,
     }
 
 
@@ -575,10 +681,25 @@ def choose_move_model(game_state: Dict) -> Optional[str]:
     scores = {}
     for move in legal:
         feats = _candidate_features(game_state, move)
+        # Основной score из модели
         score = intercept
         for i, name in enumerate(names):
             z = (feats.get(name, 0.0) - mean[i]) / std[i] if std[i] else 0.0
             score += coef[i] * z
+        
+        
+        # new
+        # Ручные поправки поверх модели
+        hunger_p = _hunger_priority(game_state["you"], board["snakes"])
+
+        # Агрессивный бонус за безопасную еду пропорционально срочности
+        score += feats.get("safe_food_nearby", 0.0) * hunger_p * 0.8
+
+        # Штраф за отставание в росте
+        score -= feats.get("length_deficit", 0.0) * 3.0
+
+        # Бонус за срочность роста
+        score += feats.get("growth_urgency", 0.0) * 5.0
         
         # Хард-блок: если flood fill меньше нашей длины — почти верная ловушка
         dx, dy = DIRECTIONS[move]
@@ -592,7 +713,7 @@ def choose_move_model(game_state: Dict) -> Optional[str]:
 
     return max(scores, key=scores.__getitem__)
           
-    return best_move
+#     return best_move
 
 
 def _legal_moves(game_state: Dict) -> List[str]:
