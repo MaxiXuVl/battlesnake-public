@@ -181,7 +181,7 @@ def choose_move_lookahead(game_state: Dict) -> Optional[str]:
             score = min_score
         
         if score > best_score:
-            best_score, best_move = score, best_move or my_move
+            best_score = score
             best_move = my_move
     
     return best_move
@@ -579,7 +579,6 @@ def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
 _MODEL: Dict = {
     "feature_names": [
         "space_capped",
-        "can_kill",
         "open_space",
         "voronoi",
         "reaches_tail",
@@ -595,7 +594,6 @@ _MODEL: Dict = {
     ],
     "mean": [
         7.357954545454546,
-        15,
         100.9034090909091,
         48.26988636363637,
         0.9943181818181818,
@@ -611,9 +609,9 @@ _MODEL: Dict = {
     ],
     "std": [
         3.5995966185276513,
-        22.80542174802676,
-        31.41119158524981,
-        0.07516338951888041,
+        22.80542174802676,   # open_space
+        31.41119158524981,   # voronoi ← теперь правильно
+        0.07516338951888041, # reaches_tail ← теперь правильно
         0.6235520417417705,
         0.20198444088469822,
         7.9675173248507924,
@@ -627,8 +625,8 @@ _MODEL: Dict = {
     "coef": [
         0.00010539398521136327,
         -1.6778512168946185,
-        80.89420182766183,
-        9.793855564450467,
+        80.89420182766183,   # voronoi ← теперь правильно
+        9.793855564450467,   # reaches_tail ← теперь правильно
         0.7884630868036275,
         -11.025170822665032,
         -0.7981723553489,
@@ -681,34 +679,45 @@ def choose_move_model(game_state: Dict) -> Optional[str]:
     scores = {}
     for move in legal:
         feats = _candidate_features(game_state, move)
-        # Основной score из модели
         score = intercept
         for i, name in enumerate(names):
             z = (feats.get(name, 0.0) - mean[i]) / std[i] if std[i] else 0.0
             score += coef[i] * z
-        
-        
-        # new
-        # Ручные поправки поверх модели
-        hunger_p = _hunger_priority(game_state["you"], board["snakes"])
 
-        # Агрессивный бонус за безопасную еду пропорционально срочности
-        score += feats.get("safe_food_nearby", 0.0) * hunger_p * 0.8
+        # --- Ручные поправки ---
 
-        # Штраф за отставание в росте
-        score -= feats.get("length_deficit", 0.0) * 3.0
+        # Убираем старые слабые корректировки, добавляем сильные
 
-        # Бонус за срочность роста
-        score += feats.get("growth_urgency", 0.0) * 5.0
-        
-        # Хард-блок: если flood fill меньше нашей длины — почти верная ловушка
+        # 1. Проактивный поиск еды — всегда активен, не зависит от порога голода.
+        #    safe_food_nearby = width+height - dist_to_safe_food, max ~22 на 11x11
+        safe_fn = feats.get("safe_food_nearby", 0.0)
+        if safe_fn > 0:
+            max_enemy_len = max(
+                (s["length"] for s in board["snakes"] if s["id"] != you["id"]), default=0
+            )
+            # Чем больше отстаём — тем важнее еда. При паритете тоже едим.
+            length_factor = max(1.0, 1.0 + (max_enemy_len - my_length) * 0.5)
+            # Базовый приоритет еды: сравним с voronoi (4-43 очка)
+            score += safe_fn * length_factor * 1.8
+
+        # 2. Экстренный голод: когда health < 40, еда важнее всего кроме выживания
+        hunger_p = _hunger_priority(you, board["snakes"])
+        if hunger_p > 0:
+            score += safe_fn * hunger_p * 15.0  # до ~330 очков = перекрывает voronoi
+
+        # 3. Убийство слабых противников — только когда сыты и длиннее
+        if feats.get("can_kill", 0.0) > 0:
+            kill_bonus = 30.0 * (1.0 - min(1.0, hunger_p * 2))
+            score += kill_bonus
+
+        # 4. Хард-блок ловушки
         dx, dy = DIRECTIONS[move]
-        head = (you["head"]["x"], you["head"]["y"])
-        nxt = (head[0] + dx, head[1] + dy)
+        head_pt = (you["head"]["x"], you["head"]["y"])
+        nxt = (head_pt[0] + dx, head_pt[1] + dy)
         space = _flood_fill(nxt, occupied, width, height, limit=width * height)
         if space < my_length:
-            score -= 50_000  # жёстко штрафуем, не запрещаем (вдруг других нет)
-        
+            score -= 50_000
+
         scores[move] = score
 
     return max(scores, key=scores.__getitem__)
